@@ -1,13 +1,12 @@
 
 import re
 from datetime import date
-from typing import Any
 
 from fastapi import FastAPI
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field
 from fastapi.responses import JSONResponse
 
-app = FastAPI(title="Invoice Extraction API")
+app = FastAPI()
 
 
 class InvoiceRequest(BaseModel):
@@ -20,103 +19,102 @@ class InvoiceResponse(BaseModel):
     currency: str
     date: str
 
-    @field_validator("currency")
-    @classmethod
-    def validate_currency(cls, value: str) -> str:
-        value = value.upper()
-        if not re.fullmatch(r"[A-Z]{3}", value):
-            raise ValueError("Currency must be a 3-letter code")
-        return value
 
-    @field_validator("date")
-    @classmethod
-    def validate_date(cls, value: str) -> str:
-        date.fromisoformat(value)
-        return value
-
-
-def extract_invoice(text: str) -> dict[str, Any]:
-    # Normalize whitespace while preserving the invoice's content.
+def extract_invoice(text: str) -> dict:
     text = text.replace("\u00a0", " ")
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
-    normalized = "\n".join(lines)
+    lines = [x.strip() for x in text.splitlines() if x.strip()]
+    content = "\n".join(lines)
 
-    # Vendor: prefer explicit vendor/supplier/merchant labels.
+    # Vendor
     vendor = None
+
     for line in lines:
-        match = re.search(
-            r"(?i)\b(?:vendor|supplier|merchant|billed\s+by|from)"
-            r"\s*[:\-]\s*(.+)",
+        m = re.search(
+            r"(?i)^\s*(?:vendor(?:\s+name)?|supplier|merchant|"
+            r"billed\s+by|issued\s+by)\s*[:\-]\s*(.+?)\s*$",
             line,
         )
-        if match:
-            vendor = match.group(1).strip()
+        if m:
+            vendor = m.group(1).strip()
             break
 
-    # Fallback: look for a company name ending in a legal suffix.
     if not vendor:
-        match = re.search(
-            r"(?im)^([^\n]{2,100}?\b"
-            r"(?:Industries|Inc\.?|LLC|Ltd\.?|Limited|Corporation|Corp\.?))"
-            r"\s*$",
-            normalized,
+        m = re.search(
+            r"(?im)^\s*([A-Za-z0-9][^\n]{1,100}?"
+            r"(?:Industries|Incorporated|Corporation|Corp\.?|"
+            r"Limited|Ltd\.?|LLC|Inc\.?))\s*$",
+            content,
         )
-        if match:
-            vendor = match.group(1).strip()
+        if m:
+            vendor = m.group(1).strip()
 
     if not vendor:
-        # Best effort for otherwise unlabeled invoice headers.
+        # Common invoice header fallback.
         for line in lines[:5]:
-            if re.search(r"[A-Za-z]", line) and not re.search(
-                r"(?i)\b(invoice|date|total|amount|due|bill to)\b", line
+            if (
+                re.search(r"[A-Za-z]", line)
+                and not re.search(
+                    r"(?i)invoice|due date|invoice date|"
+                    r"total|amount|currency|bill to|payment",
+                    line,
+                )
             ):
                 vendor = line
                 break
 
-    # Currency: recognize the currency code or common symbols.
+    # Currency
     currency = None
-    currency_match = re.search(
-        r"(?i)\b(USD|EUR|GBP)\b", normalized
-    )
-    if currency_match:
-        currency = currency_match.group(1).upper()
+    m = re.search(r"(?i)\b(USD|EUR|GBP)\b", content)
+    if m:
+        currency = m.group(1).upper()
     else:
-        symbol_match = re.search(r"[$€£]", normalized)
-        if symbol_match:
+        # Symbols are fallback only.
+        symbols = re.findall(r"[$€£]", content)
+        if symbols:
             currency = {"$": "USD", "€": "EUR", "£": "GBP"}[
-                symbol_match.group(0)
+                symbols[0]
             ]
 
-    # Amount: prioritize total due / amount due / balance due.
+    # Amount: prefer specifically labeled totals.
     amount = None
     amount_patterns = [
-        r"(?im)^\s*(?:total\s+due|amount\s+due|balance\s+due|"
-        r"grand\s+total|total\s+payable)\s*[:\-]?\s*"
-        r"(?:USD|EUR|GBP|[$€£])?\s*"
-        r"([0-9][0-9,]*(?:\.[0-9]{1,2})?)",
-        r"(?i)\b(?:USD|EUR|GBP)\s*"
-        r"([0-9][0-9,]*(?:\.[0-9]{1,2})?)",
-        r"[$€£]\s*([0-9][0-9,]*(?:\.[0-9]{1,2})?)",
+        r"(?im)^\s*(?:total\s+amount\s+due|total\s+due|"
+        r"amount\s+due|balance\s+due|grand\s+total|"
+        r"total\s+payable|invoice\s+total|total|amount)\s*"
+        r"[:=\-]?\s*(?:(?:USD|EUR|GBP)\s*)?[$€£]?\s*"
+        r"([0-9][0-9,]*(?:\.[0-9]{1,2})?)\b",
+        r"(?i)\b(?:USD|EUR|GBP)\s*[$€£]?\s*"
+        r"([0-9][0-9,]*(?:\.[0-9]{1,2})?)\b",
+        r"[$€£]\s*([0-9][0-9,]*(?:\.[0-9]{1,2})?)\b",
     ]
+
     for pattern in amount_patterns:
-        match = re.search(pattern, normalized)
-        if match:
-            amount = float(match.group(1).replace(",", ""))
+        m = re.search(pattern, content)
+        if m:
+            amount = float(m.group(1).replace(",", ""))
             break
 
-    # Due date: prioritize explicit due-date labels.
+    # Due date: prioritize due-date labels over other dates.
     due_date = None
     date_patterns = [
-        r"(?im)^\s*(?:payment\s+)?due\s+date\s*[:\-]?\s*"
+        r"(?im)^\s*(?:payment\s+)?due\s+date\s*[:=\-]?\s*"
         r"(20\d{2}-\d{2}-\d{2})\b",
-        r"(?i)\b(?:payable\s+by|due\s+by)\s*[:\-]?\s*"
+        r"(?im)^\s*(?:payment\s+)?due\s*[:=\-]?\s*"
         r"(20\d{2}-\d{2}-\d{2})\b",
-        r"\b(20\d{2}-\d{2}-\d{2})\b",
+        r"(?i)\b(?:payable\s+by|due\s+by)\s*[:=\-]?\s*"
+        r"(20\d{2}-\d{2}-\d{2})\b",
     ]
+
     for pattern in date_patterns:
-        match = re.search(pattern, normalized)
-        if match:
-            candidate = match.group(1)
+        m = re.search(pattern, content)
+        if m:
+            due_date = m.group(1)
+            break
+
+    # Fallback if no explicit due-date label exists.
+    if not due_date:
+        dates = re.findall(r"\b20\d{2}-\d{2}-\d{2}\b", content)
+        for candidate in dates:
             try:
                 date.fromisoformat(candidate)
                 due_date = candidate
@@ -124,8 +122,11 @@ def extract_invoice(text: str) -> dict[str, Any]:
             except ValueError:
                 continue
 
-    if not vendor or amount is None or not currency or not due_date:
-        raise ValueError("Could not extract all required invoice fields")
+    if not all([vendor, amount is not None, currency, due_date]):
+        raise ValueError("Missing invoice fields")
+
+    # Validate the extracted date.
+    date.fromisoformat(due_date)
 
     return {
         "vendor": vendor,
@@ -137,16 +138,15 @@ def extract_invoice(text: str) -> dict[str, Any]:
 
 @app.get("/")
 def root():
-    return {"status": "ok", "endpoint": "POST /extract"}
+    return {"status": "ok"}
 
 
 @app.post("/extract", response_model=InvoiceResponse)
 def extract(request: InvoiceRequest):
     try:
-        result = extract_invoice(request.text)
-        return InvoiceResponse(**result)
-    except (ValueError, TypeError):
+        return extract_invoice(request.text)
+    except (ValueError, TypeError, OverflowError):
         return JSONResponse(
             status_code=422,
-            content={"detail": "Unable to extract a valid invoice"},
+            content={"detail": "Unable to extract invoice fields"},
         )
